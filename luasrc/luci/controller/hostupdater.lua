@@ -144,26 +144,42 @@ function action_config()
 			data.enabled = (fe == "1" or fe == "true")
 			data.interval = http.formvalue("interval")
 		end
-		local enabled = data.enabled and "1" or "0"
-		local interval = tostring(data.interval or "6")
-		uci:set("hostupdater", "main", "enabled", enabled)
-		uci:set("hostupdater", "main", "interval", interval)
+		-- 只更新请求里出现的字段，避免部分提交把其它设置冲掉
+		local touched = false
+
+		if data.enabled ~= nil then
+			uci:set("hostupdater", "main", "enabled", data.enabled and "1" or "0")
+			touched = true
+		end
+
+		if data.interval ~= nil and tostring(data.interval) ~= "" then
+			uci:set("hostupdater", "main", "interval", tostring(data.interval))
+			touched = true
+		end
+
 		-- reload_dns: auto / 1 / 0
-		local reload_dns = data.reload_dns
-		if reload_dns ~= nil then
-			reload_dns = tostring(reload_dns)
+		if data.reload_dns ~= nil then
+			local reload_dns = tostring(data.reload_dns)
 			if reload_dns ~= "auto" and reload_dns ~= "1" and reload_dns ~= "0" then
 				reload_dns = "auto"
 			end
 			uci:set("hostupdater", "main", "reload_dns", reload_dns)
+			touched = true
 		end
-		uci:commit("hostupdater")
-		if enabled == "1" then
-			sys.exec("/etc/init.d/hostupdater enable >/dev/null 2>&1")
-			sys.exec("/etc/init.d/hostupdater restart >/dev/null 2>&1")
-		else
-			sys.exec("/etc/init.d/hostupdater stop >/dev/null 2>&1")
-			sys.exec("/etc/init.d/hostupdater disable >/dev/null 2>&1")
+
+		if touched then
+			uci:commit("hostupdater")
+		end
+
+		-- 服务启停只在 enabled 被显式提交时处理
+		if data.enabled ~= nil then
+			if data.enabled then
+				sys.exec("/etc/init.d/hostupdater enable >/dev/null 2>&1")
+				sys.exec("/etc/init.d/hostupdater restart >/dev/null 2>&1")
+			else
+				sys.exec("/etc/init.d/hostupdater stop >/dev/null 2>&1")
+				sys.exec("/etc/init.d/hostupdater disable >/dev/null 2>&1")
+			end
 		end
 		prepare_content("application/json")
 		write_json({ success = true })

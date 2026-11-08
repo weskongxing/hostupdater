@@ -193,6 +193,13 @@ LuCI 页面（**服务 → Host Updater**）新增「更新后重启 dnsmasq」�
 > 注：`luasrc/luci/model/cbi/hostupdater.lua` 是**死代码**（控制器只用 `template()` 渲染自定义视图，
 > 无任何 `cbi()` 引用），因此本次**未**修改它。
 
+顺带修掉一个原有缺陷：`action_config` 的 POST 原本是「先取默认值再无条件写回」，
+只要请求里缺字段就会把该字段重置。例如只提交 `{"reload_dns":"0"}` 会连带把
+`enabled` 置 0、`interval` 重置为 6，并删掉 crontab 里的定时任务、停掉服务。
+
+现改为**只更新请求里出现的字段**，且仅当 `enabled` 被显式提交时才启停服务。
+实测：只提交 `{"reload_dns":"auto"}` 后 `enabled`/`interval`/crontab 均保持不变。
+
 新增子命令：
 
 ```sh
@@ -229,3 +236,15 @@ LuCI 页面（**服务 → Host Updater**）新增「更新后重启 dnsmasq」�
 | `update-source` 单源更新 | ✔ |
 | `restore` 后触发重载 | ✔ |
 | `reload_dns=1` 实际调用 `/etc/init.d/dnsmasq reload` | ✔ |
+
+路由上实测（修复版部署后）：
+
+| 用例 | 结果 |
+|---|---|
+| `reload_dns=auto` + 内容无变化 → 不重启 | ✔ dnsmasq pid 不变，日志 `hosts 数据行无变化，跳过写入` |
+| `reload_dns=0` → 不重启 | ✔ dnsmasq pid 不变 |
+| `reload-dns` 子命令（配置为 0 时） | ✔ 强制重启，pid `843 -> 2126` |
+| `/config` GET 返回 `reload_dns` | ✔ `{"enabled":true,"interval":"1","reload_dns":"0"}` |
+| `/config` POST 非法值 `xxx` | ✔ 回落为 `auto`（白名单校验生效） |
+| 部分字段 POST 不冲掉其它设置 | ✔ 只提交 `reload_dns` 后 `enabled`/`interval`/crontab 不变 |
+| LuCI 页面渲染 | ✔ `id="reload_dns"` 存在，三个选项正常，无 Lua 报错 |
