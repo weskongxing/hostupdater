@@ -21,8 +21,7 @@ LOG_FILE="/var/log/hostupdater.log"
 
 # 默认配置（可被 /etc/config/hostupdater 覆盖）
 DEFAULT_BACKUP_KEEP=24
-DEFAULT_RELOAD_DNS=1
-
+DEFAULT_RELOAD_DNS="auto"
 # 日志函数
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
@@ -266,7 +265,8 @@ merge_hosts() {
 }
 
 # 更新hosts文件
-# 修复点: 先写临时文件并校验，再原子替换，避免写坏 /etc/hosts
+# 返回值: 0=已写入并生效  1=失败  2=内容未变化（无需写入）
+# 修复点: 先写临时文件并校验，再原地覆写，避免写坏 /etc/hosts
 update_hosts() {
     local new_content="$1"
     local tmp_file="${HOSTS_FILE}.new.$$"
@@ -291,6 +291,21 @@ update_hosts() {
         return 1
     fi
 
+    # 数据行无变化则跳过写入，避免无谓写 flash 和触发 DNS 重启
+    # 只比较非注释行：生成内容的头部带时间戳，整文件 cmp 永远不相等
+    if [ -f "$HOSTS_FILE" ]; then
+        local new_data="$TEMP_DIR/cmp.new"
+        local cur_data="$TEMP_DIR/cmp.cur"
+        grep -vE '^[[:space:]]*(#|$)' "$tmp_file" > "$new_data" 2>/dev/null
+        grep -vE '^[[:space:]]*(#|$)' "$HOSTS_FILE" > "$cur_data" 2>/dev/null
+        if cmp -s "$new_data" "$cur_data"; then
+            log "hosts 数据行无变化，跳过写入"
+            rm -f "$tmp_file" "$new_data" "$cur_data" 2>/dev/null
+            return 2
+        fi
+        rm -f "$new_data" "$cur_data" 2>/dev/null
+    fi
+
     chmod 644 "$tmp_file" 2>/dev/null
 
     # 注意: 必须原地覆写 (cp 会以 O_TRUNC 打开已存在的文件，inode 保持不变)，
@@ -312,20 +327,35 @@ update_hosts() {
 
 # 让新的 hosts 立即生效
 #
+# 参数: $1 = changed | unchanged （本次是否真的改动了 hosts 内容）
+#
 # 修复点: 原实现只写文件，不通知 dnsmasq，新条目要等重启路由才生效。
+#
+# reload_dns 取值:
+#   1    总是重启（默认）
+#   auto 仅当 hosts 内容发生变化时才重启（推荐，不会整点无谓中断）
+#   0    从不重启（需手动 /etc/init.d/dnsmasq restart）
 #
 # 为什么用 restart 而不是 reload:
 #   OpenWrt 的 /etc/init.d/dnsmasq reload 只做 rc_procd start_service + procd_send_signal(SIGHUP)。
-#   在 ImmortalWrt 25.12.2 / dnsmasq 2.93 + ujail 环境下实测 SIGHUP 不会重新读取 /etc/hosts，
-#   （另外 dnsmasq 被 ujail 以 bind-mount 方式映射 /etc/hosts，若外部把文件换成新 inode，
-#    jail 内可能一直看到旧内容）。因此这里直接 restart，确定生效。
+#   在 ImmortalWrt 25.12.2 / dnsmasq 2.93 + ujail 环境下实测 SIGHUP 不会重新读取 /etc/hosts。
 #   DHCP 租约存放在 /tmp/dhcp.leases，restart 不会丢租约，中断仅 1~2 秒。
 reload_dns() {
-    local enabled
-    enabled=$(read_option "reload_dns" "$DEFAULT_RELOAD_DNS")
-    if [ "$enabled" = "0" ]; then
-        log "已按配置跳过 dnsmasq 重启 (reload_dns=0)"
-        return 0
+    local changed="${1:-changed}"
+    local force="${2:-}"
+    local mode
+    mode=$(read_option "reload_dns" "$DEFAULT_RELOAD_DNS")
+
+    if [ "$force" != "force" ]; then
+        if [ "$mode" = "0" ]; then
+            log "reload_dns=0，跳过 dnsmasq 重启（新条目需手动执行 /etc/init.d/dnsmasq restart 后生效）"
+            return 0
+        fi
+
+        if [ "$mode" = "auto" ] && [ "$changed" = "unchanged" ]; then
+            log "reload_dns=auto 且内容未变化，跳过 dnsmasq 重启"
+            return 0
+        fi
     fi
 
     if [ -x /etc/init.d/dnsmasq ]; then
@@ -410,10 +440,16 @@ EOF
         local merged_content
         merged_content=$(merge_hosts)
         if [ -n "$merged_content" ]; then
-            if update_hosts "$merged_content"; then
-                # 关键: 写入成功后立即重载 DNS
-                reload_dns
+            update_hosts "$merged_content"
+            local rc=$?
+            if [ "$rc" -eq 0 ]; then
+                reload_dns "changed"
                 log "hosts更新完成"
+                cleanup
+                return 0
+            elif [ "$rc" -eq 2 ]; then
+                reload_dns "unchanged"
+                log "hosts更新完成 (内容无变化)"
                 cleanup
                 return 0
             else
@@ -442,7 +478,14 @@ show_status() {
     echo "备份目录: $BACKUP_DIR"
     echo "日志文件: $LOG_FILE"
     echo "备份保留份数: $(read_option 'backup_keep' "$DEFAULT_BACKUP_KEEP")"
-    echo "更新后重载DNS: $(read_option 'reload_dns' "$DEFAULT_RELOAD_DNS")"
+    local rm
+    rm=$(read_option 'reload_dns' "$DEFAULT_RELOAD_DNS")
+    case "$rm" in
+        1)    echo "更新后重启DNS: 1 (总是重启)" ;;
+        auto) echo "更新后重启DNS: auto (仅内容变化时重启)" ;;
+        0)    echo "更新后重启DNS: 0 (从不重启)" ;;
+        *)    echo "更新后重启DNS: $rm" ;;
+    esac
     echo ""
 
     if [ -f "$SOURCES_FILE" ]; then
@@ -471,7 +514,7 @@ show_help() {
     echo "  status                  显示状态"
     echo "  backup                  创建备份"
     echo "  restore                 还原到原始状态"
-    echo "  reload-dns              手动重载 dnsmasq"
+    echo "  reload-dns              手动重启 dnsmasq（忽略 reload_dns 配置）"
     echo "  help                    显示此帮助信息"
     echo ""
     echo "示例:"
@@ -486,7 +529,7 @@ do_restore() {
         log "已还原到原始hosts文件"
         echo "已还原到原始hosts文件"
         # 还原后同样需要让 dnsmasq 重新读取
-        reload_dns
+        reload_dns "changed"
     else
         log "未找到原始hosts备份文件"
         echo "错误: 未找到原始hosts备份文件"
@@ -516,8 +559,14 @@ case "$1" in
         cleanup
         if download_hosts "$url" "$name"; then
             merged=$(merge_hosts)
-            if update_hosts "$merged"; then
-                reload_dns
+            update_hosts "$merged"
+            local rc=$?
+            if [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]; then
+                if [ "$rc" -eq 0 ]; then
+                    reload_dns "changed"
+                else
+                    reload_dns "unchanged"
+                fi
                 cleanup
                 echo "已完成单源更新: $name"
                 exit 0
@@ -543,7 +592,8 @@ case "$1" in
         do_restore
         ;;
     reload-dns)
-        reload_dns
+        # 手动执行时忽略 reload_dns 配置，强制重启
+        reload_dns "changed" "force"
         ;;
     help|--help|-h)
         show_help

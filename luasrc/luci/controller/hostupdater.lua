@@ -148,6 +148,15 @@ function action_config()
 		local interval = tostring(data.interval or "6")
 		uci:set("hostupdater", "main", "enabled", enabled)
 		uci:set("hostupdater", "main", "interval", interval)
+		-- reload_dns: auto / 1 / 0
+		local reload_dns = data.reload_dns
+		if reload_dns ~= nil then
+			reload_dns = tostring(reload_dns)
+			if reload_dns ~= "auto" and reload_dns ~= "1" and reload_dns ~= "0" then
+				reload_dns = "auto"
+			end
+			uci:set("hostupdater", "main", "reload_dns", reload_dns)
+		end
 		uci:commit("hostupdater")
 		if enabled == "1" then
 			sys.exec("/etc/init.d/hostupdater enable >/dev/null 2>&1")
@@ -161,8 +170,9 @@ function action_config()
 	else
 		local enabled = (uci:get("hostupdater", "main", "enabled") == "1")
 		local interval = uci:get("hostupdater", "main", "interval") or "6"
+		local reload_dns = uci:get("hostupdater", "main", "reload_dns") or "auto"
 		prepare_content("application/json")
-		write_json({ enabled = enabled, interval = interval })
+		write_json({ enabled = enabled, interval = interval, reload_dns = reload_dns })
 	end
 end
 

@@ -56,15 +56,27 @@ config hostupdater 'main'
 	option auto_backup '1'
 	option log_level 'info'
 
-	# 更新 /etc/hosts 后自动重载 dnsmasq，让新条目立即生效（默认 1）
-	option reload_dns '1'
+	# 更新 /etc/hosts 后是否重启 dnsmasq（dnsmasq 只在启动时读取 hosts）
+	#   auto = 仅当 hosts 数据行真正变化时才重启（默认，推荐）
+	#   1    = 每次更新都重启
+	#   0    = 从不重启，需手动 /etc/init.d/dnsmasq restart
+	option reload_dns 'auto'
 
 	# 备份文件保留份数，超出的自动删除（默认 24，0 = 不轮转）
 	option backup_keep '24'
 ```
 
-> ⚠️ `reload_dns` 很重要：dnsmasq 在启动时把 hosts 读进内存，不主动重读。
-> 关掉它的话，更新完必须手动执行 `/etc/init.d/dnsmasq reload` 或重启，否则设备拿到的仍是旧值。
+> ⚠️ `reload_dns` 很重要：dnsmasq 在启动时把 hosts 读进内存，不主动重读；
+> 且 `/etc/init.d/dnsmasq reload`（仅发 SIGHUP）实测在本环境下**不会**重新读取 hosts。
+>
+> | 取值 | 行为 | 适用 |
+> |---|---|---|
+> | `auto`（默认） | 只有当 hosts 的数据行真正变化时才重启 dnsmasq | 推荐：既不整点中断，内容变了又能立即生效 |
+> | `1` | 每次更新都重启 | 需要强制刷新时 |
+> | `0` | 从不重启 | 手动维护，或不想被中断；需自行 `/etc/init.d/dnsmasq restart` |
+>
+> 也可以在 LuCI 页面 **服务 → Host Updater** 的「更新后重启 dnsmasq」下拉框里直接选。
+> 手动刷新：`/usr/bin/hostupdater reload-dns`（忽略该配置，强制执行）。
 
 详细修复记录见 [CHANGELOG.md](CHANGELOG.md)。
 

@@ -32,6 +32,19 @@
 					</select>
 				</div>
 			</div>
+			<div class="cbi-value">
+				<label class="cbi-value-title">更新后重启 dnsmasq</label>
+				<div class="cbi-value-field">
+					<select id="reload_dns">
+						<option value="auto" selected>仅内容变化时（推荐）</option>
+						<option value="1">总是重启</option>
+						<option value="0">从不重启</option>
+					</select>
+					<div class="cbi-value-description">
+						dnsmasq 只在启动时读取 /etc/hosts，不重启就读不到新条目。选「仅内容变化时」可在内容真正变动时立即生效，而内容没变时不会整点中断；选「从不重启」则需手动执行 /etc/init.d/dnsmasq restart。
+					</div>
+				</div>
+			</div>
 		</div>
 		<div class="hu-actions">
 			<button class="btn cbi-button-save" onclick="hostupdater.saveConfig()"><%:Save Configuration%></button>
@@ -99,8 +112,8 @@
 	var hostupdater = {
 		init(){ this.loadConfig(); this.loadSources(); this.loadHosts(); },
 		msg(t,m,ok){ var c=document.getElementById('hostupdater-container'); var el=document.createElement('div'); el.className='alert '+(ok?'alert-success':'alert-danger'); el.innerHTML='<strong>'+esc(t)+'</strong>'+(m?('<br>'+esc(m)):''); c.insertAdjacentElement('afterbegin',el); setTimeout(()=>{el.remove();},2500); },
-		loadConfig(){ fetch('/cgi-bin/luci/admin/services/hostupdater/config').then(r=>r.json()).then(d=>{ document.getElementById('enabled').checked=!!d.enabled; if(d.interval) document.getElementById('interval').value=d.interval; }).catch(()=>{}); },
-		saveConfig(){ const p={enabled:document.getElementById('enabled').checked, interval:document.getElementById('interval').value}; fetch('/cgi-bin/luci/admin/services/hostupdater/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)}).then(r=>r.json()).then(d=>{ this.msg('<%:Save Configuration%>',d.success?'<%:Success%>':'<%:Failed%>',d.success); }).catch(e=>this.msg('<%:Save Configuration Failed%>',e.message,false)); },
+		loadConfig(){ fetch('/cgi-bin/luci/admin/services/hostupdater/config').then(r=>r.json()).then(d=>{ document.getElementById('enabled').checked=!!d.enabled; if(d.interval) document.getElementById('interval').value=d.interval; if(d.reload_dns!==undefined && d.reload_dns!==null) document.getElementById('reload_dns').value=String(d.reload_dns); }).catch(()=>{}); },
+		saveConfig(){ const p={enabled:document.getElementById('enabled').checked, interval:document.getElementById('interval').value, reload_dns:document.getElementById('reload_dns').value}; fetch('/cgi-bin/luci/admin/services/hostupdater/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)}).then(r=>r.json()).then(d=>{ this.msg('<%:Save Configuration%>',d.success?'<%:Success%>':'<%:Failed%>',d.success); }).catch(e=>this.msg('<%:Save Configuration Failed%>',e.message,false)); },
 		loadSources(){ fetch('/cgi-bin/luci/admin/services/hostupdater/sources').then(r=>r.json()).then(d=>this.renderSources(d||[])).catch(()=>this.renderSources([])); },
 		renderSources(list){ const wrap=document.getElementById('sources-list'); if(!list.length){ wrap.innerHTML='<p><%:No subscription sources%></p>'; return;} let html='<table class="table hu-table"><thead><tr><th><%:Name%></th><th><%:URL%></th><th><%:Status%></th><th class="hu-ops"><%:Operations%></th></tr></thead><tbody>'; list.forEach(s=>{ html+= '<tr>'+'<td>'+esc(s.name)+'</td>'+'<td class="hu-url">'+esc(s.url)+'</td>'+'<td>'+(s.enabled?'<span class="status-enabled"><%:Enabled%></span>':'<span class="status-disabled"><%:Disabled%></span>')+'</td>'+'<td class="hu-ops">'+'<button class="btn btn-mini" onclick="hostupdater.toggle(\''+encodeURIComponent(s.name)+'\')">'+(s.enabled?'<%:Disable%>':'<%:Enable%>')+'</button> '+'<button class="btn btn-mini" onclick="hostupdater.updateOne(\''+encodeURIComponent(s.name)+'\')"><%:Update%></button> '+'<button class="btn btn-mini btn-danger" onclick="hostupdater.remove(\''+encodeURIComponent(s.name)+'\')"><%:Delete%></button>'+'</td>'+'</tr>'; }); html+='</tbody></table>'; wrap.innerHTML=html; },
 		addSource(){ const name=document.getElementById('new-source-name').value.trim(); const url=document.getElementById('new-source-url').value.trim(); if(!name||!url) return this.msg('<%:Add Failed%>','<%:Please fill in name and URL%>',false); const p={name,url,enabled:true}; fetch('/cgi-bin/luci/admin/services/hostupdater/sources',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)}).then(r=>r.json()).then(d=>{ this.msg('<%:Add Subscription Source%>',d.success?'<%:Success%>':'<%:Failed%>',d.success); if(d.success){ this.loadSources(); document.getElementById('new-source-name').value=''; document.getElementById('new-source-url').value=''; }}).catch(e=>this.msg('<%:Add Failed%>',e.message,false)); },
