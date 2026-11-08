@@ -24,10 +24,12 @@ dnsmasq 实际应答 gist.github.com = 59.24.3.173   (07:00 的旧值)
 ```
 
 **修复**：新增 `reload_dns()`，在写入成功后调用：
-- 优先 `/etc/init.d/dnsmasq reload`
+- 优先 `/etc/init.d/dnsmasq restart`
 - 兜底 `killall -q -HUP dnsmasq`
 - 都失败时记录警告日志
 - 可通过 `option reload_dns '0'` 关闭
+
+> ⚠️ 为什么是 **restart** 而不是 `reload`？部署时踩到的坑，详见下方 §8。
 
 同时 `do_restore()` 和 `update-source` 分支也会触发重载。
 
@@ -104,6 +106,65 @@ dnsmasq 实际应答 gist.github.com = 59.24.3.173   (07:00 的旧值)
 #### 7. 异常分支未清理临时文件
 
 `do_update()` 中"没有找到启用的hosts源"、"合并结果为空"两条路径直接 `return`，跳过 `cleanup()`，`/tmp/hostupdater` 残留文件。已补齐。
+
+#### 8. 首次修复引入的回归：`mv` 原子替换 + `reload` 在本环境无效
+
+> 这一节是**实测部署时才发现**的，记录在此供参考。
+
+**第一版修复的错误做法**：用 `mv` 原子替换 `/etc/hosts`，再调 `/etc/init.d/dnsmasq reload`。
+
+**结果**：日志显示"已重载 dnsmasq"，但 dnsmasq 仍在应答被删掉的旧条目。
+
+**原因 1 — dnsmasq 跑在 ujail 里，`/etc/hosts` 是 bind-mount**
+
+```
+真实 /etc/hosts              inode=1947  (1974B, gist 0 条)
+/proc/<pid>/root/etc/hosts   inode=1928  (2002B, gist 1 条)   ← jail 里还是旧文件
+
+mountinfo:
+  51 40 0:20 /etc/hosts//deleted /etc/hosts ro,noatime ...
+             ^^^^^^^^^^^^^^^^^^ 指向已删除的 inode
+```
+
+`ujail` 在启动时把 `/etc/hosts` 绑定进 jail，绑的是**当时那个 inode**。一旦外部用 `mv` 换成新 inode，jail 内的挂载就变成 `/etc/hosts//deleted`，永远读旧内容。
+原实现用 `printf > /etc/hosts` 是**原地覆写**，inode 不变，所以不会踩这个坑。
+
+→ 改为先写临时文件校验，再 `cp` 原地覆写（`cp` 以 `O_TRUNC` 打开已存在文件，**inode 不变**）。
+
+**原因 2 — `/etc/init.d/dnsmasq reload` 不会重新读取 hosts**
+
+OpenWrt 的 init 脚本：
+```sh
+reload_service() {
+	nftables_clear
+	rc_procd start_service "$@"
+	procd_send_signal dnsmasq "$@"     # 默认发 SIGHUP
+}
+```
+
+在 ImmortalWrt 25.12.2 + dnsmasq 2.93 + ujail 下实测：**SIGHUP 后新写入 `/etc/hosts` 的条目依然解析不到**。
+
+决定性验证（探针记录）：
+```
+向 /etc/hosts 追加:  203.0.113.9  reload-probe.example.com
+/etc/init.d/dnsmasq reload  →  nslookup 结果: （空）          ✘
+/etc/init.d/dnsmasq restart →  nslookup 结果: 203.0.113.9    ✔
+```
+
+→ `reload_dns()` 改为直接调 `/etc/init.d/dnsmasq restart`。
+租约在 `/tmp/dhcp.leases`，restart 不丢租约，中断 1~2 秒。
+
+**部署后验证**（修复正确后的实测结果）：
+
+```
+hosts 内域名 vs dnsmasq 应答：一致 20/20
+::1 行：::1  localhost  ip6-localhost  ip6-loopback      （localhost 已恢复）
+文件内 # Timeout 条目：0 条
+备份目录：47 份 → 25 份（轮转到 24 + hosts.original）
+日志：已重启 dnsmasq，新 hosts 立即生效
+```
+
+> 教训：`reload` ≠ 重新读取。涉及“服务要重新读配置文件”的修复，必须用**可观测的方式验证生效**（往文件里塞一条探针记录再查），不能只看 init 脚本返回 0。
 
 ---
 

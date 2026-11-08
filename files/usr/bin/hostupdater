@@ -292,41 +292,56 @@ update_hosts() {
     fi
 
     chmod 644 "$tmp_file" 2>/dev/null
-    if mv "$tmp_file" "$HOSTS_FILE" 2>/dev/null; then
+
+    # 注意: 必须原地覆写 (cp 会以 O_TRUNC 打开已存在的文件，inode 保持不变)，
+    # 不用 mv 原子替换。
+    #
+    # 原因: OpenWrt 的 dnsmasq 跑在 ujail 里，/etc/hosts 通过 bind-mount 映射进 jail。
+    # 若用 mv 换成新 inode，jail 内的 mount 会指向已删除的旧 inode
+    # （mountinfo 显示 /etc/hosts//deleted），此时即使 reload 也读不到新内容。
+    if cp "$tmp_file" "$HOSTS_FILE" 2>/dev/null; then
+        rm -f "$tmp_file" 2>/dev/null
         log "hosts文件更新成功"
         return 0
     else
-        log "hosts文件更新失败 (无法替换 $HOSTS_FILE)"
+        log "hosts文件更新失败 (无法写入 $HOSTS_FILE)"
         rm -f "$tmp_file" 2>/dev/null
         return 1
     fi
 }
 
-# 重载 DNS 服务，让新的 hosts 立即生效
-# 修复点: 原实现只写文件不通知 dnsmasq，导致新条目要等重启才生效
+# 让新的 hosts 立即生效
+#
+# 修复点: 原实现只写文件，不通知 dnsmasq，新条目要等重启路由才生效。
+#
+# 为什么用 restart 而不是 reload:
+#   OpenWrt 的 /etc/init.d/dnsmasq reload 只做 rc_procd start_service + procd_send_signal(SIGHUP)。
+#   在 ImmortalWrt 25.12.2 / dnsmasq 2.93 + ujail 环境下实测 SIGHUP 不会重新读取 /etc/hosts，
+#   （另外 dnsmasq 被 ujail 以 bind-mount 方式映射 /etc/hosts，若外部把文件换成新 inode，
+#    jail 内可能一直看到旧内容）。因此这里直接 restart，确定生效。
+#   DHCP 租约存放在 /tmp/dhcp.leases，restart 不会丢租约，中断仅 1~2 秒。
 reload_dns() {
     local enabled
     enabled=$(read_option "reload_dns" "$DEFAULT_RELOAD_DNS")
     if [ "$enabled" = "0" ]; then
-        log "已按配置跳过 dnsmasq 重载 (reload_dns=0)"
+        log "已按配置跳过 dnsmasq 重启 (reload_dns=0)"
         return 0
     fi
 
-    # 优先用 init 脚本（会做热点/订阅等完整刷新）
     if [ -x /etc/init.d/dnsmasq ]; then
-        if /etc/init.d/dnsmasq reload >/dev/null 2>&1; then
-            log "已重载 dnsmasq，新 hosts 立即生效"
+        if /etc/init.d/dnsmasq restart >/dev/null 2>&1; then
+            log "已重启 dnsmasq，新 hosts 立即生效"
             return 0
         fi
     fi
 
-    # 兜底: 直接给 dnsmasq 发 SIGHUP
+    # 兜底: 直接给 dnsmasq 发 SIGHUP（部分环境可用）
     if killall -q -HUP dnsmasq 2>/dev/null; then
-        log "已向 dnsmasq 发送 SIGHUP"
+        log "已向 dnsmasq 发送 SIGHUP（如未生效请手动重启 dnsmasq）"
         return 0
     fi
 
-    log "警告: 未能重载 dnsmasq，新 hosts 需重启或手动执行 /etc/init.d/dnsmasq reload 后生效"
+    log "警告: 未能重启 dnsmasq，新 hosts 需手动执行 /etc/init.d/dnsmasq restart 后生效"
     return 1
 }
 
