@@ -3,6 +3,14 @@
 # Host Updater Script
 # 管理多个hosts订阅源，支持定时抓取和手动抓取
 # Copyright (c) 2025 Gxxkx
+#
+# 本版本修复（详见 CHANGELOG.md）:
+#   1. 写入 /etc/hosts 后自动重载 dnsmasq，新条目立即生效
+#   2. 过滤订阅源中标记为 Timeout/失效 的条目，避免写入废 IP
+#   3. 去重时保留原始 hosts 段完整内容（修复 ::1 丢失 localhost）
+#   4. 下载使用 --fail --retry，避免 HTTP 错误页被当作有效内容
+#   5. 原子写入 + 内容校验，避免写坏 /etc/hosts
+#   6. 备份文件自动轮转，避免长期占满 flash
 
 CONFIG_FILE="/etc/config/hostupdater"
 SOURCES_FILE="/etc/hostupdater/sources.conf"
@@ -10,6 +18,10 @@ HOSTS_FILE="/etc/hosts"
 BACKUP_DIR="/etc/hostupdater/backup"
 TEMP_DIR="/tmp/hostupdater"
 LOG_FILE="/var/log/hostupdater.log"
+
+# 默认配置（可被 /etc/config/hostupdater 覆盖）
+DEFAULT_BACKUP_KEEP=24
+DEFAULT_RELOAD_DNS=1
 
 # 日志函数
 log() {
@@ -22,9 +34,47 @@ error_exit() {
     exit 1
 }
 
+# 读取 uci 配置项，找不到时返回默认值
+# 用法: read_option <name> <default>
+read_option() {
+    local key="$1"
+    local def="$2"
+    local val=""
+
+    if command -v uci >/dev/null 2>&1; then
+        val=$(uci -q get "hostupdater.main.${key}" 2>/dev/null)
+    fi
+
+    # 没有 uci（例如容器/测试环境）时直接读配置文件
+    if [ -z "$val" ] && [ -f "$CONFIG_FILE" ]; then
+        val=$(sed -n "s/^[[:space:]]*option[[:space:]]*${key}[[:space:]]*'\?\([^']*\)'\?[[:space:]]*$/\1/p" \
+              "$CONFIG_FILE" 2>/dev/null | head -n 1)
+    fi
+
+    if [ -z "$val" ]; then
+        val="$def"
+    fi
+    echo "$val"
+}
+
 # 创建必要的目录
 create_dirs() {
     mkdir -p "$BACKUP_DIR" "$TEMP_DIR"
+}
+
+# 备份文件轮转：只保留最近 N 份
+rotate_backups() {
+    local keep
+    keep=$(read_option "backup_keep" "$DEFAULT_BACKUP_KEEP")
+    case "$keep" in
+        ''|*[!0-9]*) keep="$DEFAULT_BACKUP_KEEP" ;;
+    esac
+    [ "$keep" -le 0 ] && return 0
+
+    # 按时间倒序列出，删掉第 (keep+1) 个及更旧的
+    ls -1t "$BACKUP_DIR"/hosts.2* 2>/dev/null | tail -n +$((keep + 1)) | while IFS= read -r old; do
+        [ -n "$old" ] && rm -f "$old"
+    done
 }
 
 # 备份当前hosts文件
@@ -35,6 +85,30 @@ backup_hosts() {
     fi
     cp "$HOSTS_FILE" "$BACKUP_DIR/hosts.$(date +%Y%m%d_%H%M%S)"
     log "已备份当前hosts文件"
+    rotate_backups
+}
+
+# 判断 IPv4 是否可作为 hosts 记录使用
+# 过滤掉 DNS 污染/失效源常见的垃圾地址：0.0.0.0/8、127.0.0.0/8、224.0.0.0/4 及以上
+is_usable_ipv4() {
+    local ip="$1"
+    local o1="${ip%%.*}"
+
+    case "$o1" in
+        ''|*[!0-9]*) return 1 ;;
+    esac
+    [ "$o1" -le 0 ] && return 1
+    [ "$o1" -eq 127 ] && return 1
+    [ "$o1" -ge 224 ] && return 1
+    return 0
+}
+
+# 判断 IPv6 是否可作为 hosts 记录使用（过滤 :: 与 ::1）
+is_usable_ipv6() {
+    case "$1" in
+        ''|::|::1|0:0:0:0:0:0:0:0|0:0:0:0:0:0:0:1) return 1 ;;
+    esac
+    return 0
 }
 
 # 下载hosts文件
@@ -42,10 +116,13 @@ download_hosts() {
     local url="$1"
     local name="$2"
     local temp_file="$TEMP_DIR/${name}.tmp"
-    
+
     log "正在下载: $name ($url)"
-    
-    if curl -s -L -o "$temp_file" "$url" --connect-timeout 30 --max-time 300; then
+
+    # --fail: HTTP 4xx/5xx 视为失败，避免把错误页当 hosts
+    # --retry: 网络抖动自动重试
+    if curl -sfL --retry 3 --retry-delay 2 -o "$temp_file" "$url" \
+            --connect-timeout 30 --max-time 300; then
         # 统一换行符，去除CRLF
         sed -i 's/\r$//' "$temp_file" 2>/dev/null
         if [ -s "$temp_file" ]; then
@@ -56,7 +133,7 @@ download_hosts() {
             return 1
         fi
     else
-        log "下载失败: $name (网络错误)"
+        log "下载失败: $name (网络错误或 HTTP 错误)"
         return 1
     fi
 }
@@ -68,39 +145,75 @@ parse_hosts() {
     local name="$2"
     local out="$TEMP_DIR/${name}.parsed"
     local count=0
+    local skipped=0
     : > "$out"
     log "正在解析: $name"
-    
+
     while IFS= read -r line; do
         case "$line" in
             \#*|"") continue ;;
         esac
         # 支持IPv4或IPv6记录（至少一个主机名）
         echo "$line" | grep -qE '^((([0-9]{1,3}\.){3}[0-9]{1,3})|([0-9A-Fa-f:]+))[[:space:]]+[^[:space:]]+' || continue
+
+        # 跳过订阅源自身标记为失效的条目（如 "# Timeout" / "# 超时" / "# Expired"）
+        if echo "$line" | grep -qiE '#[[:space:]]*(timeout|expired|dead|invalid|failed|unreachable|超时|失效|不可用)'; then
+            skipped=$((skipped+1))
+            continue
+        fi
+
+        local ip
+        ip=$(echo "$line" | awk '{print $1}')
+        case "$ip" in
+            *:*)
+                is_usable_ipv6 "$ip" || { skipped=$((skipped+1)); continue; }
+                ;;
+            *)
+                is_usable_ipv4 "$ip" || { skipped=$((skipped+1)); continue; }
+                ;;
+        esac
+
         printf "%s\n" "$line" >> "$out"
         count=$((count+1))
     done < "$file"
-    
-    log "解析完成: $name (有效行 $count)"
+
+    if [ "$skipped" -gt 0 ]; then
+        log "解析完成: $name (有效行 $count, 跳过失效/非法 $skipped)"
+    else
+        log "解析完成: $name (有效行 $count)"
+    fi
     cat "$out"
 }
 
-# 对合并结果进行去重：按出现顺序保留第一个域名映射，后续重复域名跳过；原hosts优先（因为最先写入）
+# 对合并结果进行去重：按出现顺序保留第一个域名映射，后续重复域名跳过
+#
+# 修复点:
+#   - "# BEGIN/END ORIGINAL HOSTS" 段内内容原样保留，不再被去重删掉
+#     （原实现会因 localhost 已在 127.0.0.1 行出现，而把 ::1 行的 localhost 删除）
+#   - 遇到行内 "#" 注释即停止收集主机名，避免把注释词当成域名
 dedupe_merged() {
     local in_file="$1"
     local out_file="$2"
     awk '
-    BEGIN{ OFS="\t" }
+    BEGIN{ OFS="\t"; in_orig=0 }
+    /^# BEGIN ORIGINAL HOSTS/ { in_orig=1; print; next }
+    /^# END ORIGINAL HOSTS/   { in_orig=0; print; next }
     /^#/ { print; next }
-    /^\s*$/ { print; next }
+    /^[[:space:]]*$/ { print; next }
     {
-        # 分割为IP + 主机名列表
         ip=$1; n=split($0, f, /[\t ]+/); if (n<2){ next }
         kept=""; cnt=0;
         for(i=2;i<=n;i++){
             h=f[i]; if(h=="") continue;
+            # 行内注释：后面的内容不是主机名
+            if (h ~ /^#/) break;
+            # 原始 hosts 段：原样保留，但登记名字，供后续源去重
+            if (in_orig) {
+                seen[h]=1; cnt++; kept=(kept=="" ? h : kept"\t"h);
+                continue;
+            }
             if(!(h in seen)){
-                seen[h]=1; cnt++; if(kept=="") kept=h; else kept=kept"\t"h;
+                seen[h]=1; cnt++; kept=(kept=="" ? h : kept"\t"h);
             }
         }
         if(cnt>0){ print ip, kept }
@@ -114,7 +227,7 @@ merge_hosts() {
     : > "$out"
     printf "# Generated by Host Updater on %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" >> "$out"
     printf "# Original hosts file backup: %s\n\n" "$BACKUP_DIR/hosts.original" >> "$out"
-    
+
     # 添加原始hosts文件中的所有有效条目（保留IPv4/IPv6，包括ff02组播等）
     if [ -f "$BACKUP_DIR/hosts.original" ]; then
         printf "# BEGIN ORIGINAL HOSTS\n" >> "$out"
@@ -126,7 +239,7 @@ merge_hosts() {
         done < "$BACKUP_DIR/hosts.original"
         printf "# END ORIGINAL HOSTS\n\n" >> "$out"
     fi
-    
+
     # 添加下载的hosts条目，按源包裹BEGIN/END注释
     local files_found=0
     for file in "$TEMP_DIR"/*.tmp; do
@@ -145,7 +258,7 @@ merge_hosts() {
         fi
     done
     log "待合并源文件: $files_found 个"
-    
+
     # 去重：保留最先出现（原hosts优先）
     local deout="$TEMP_DIR/merged.dedup"
     dedupe_merged "$out" "$deout"
@@ -153,16 +266,68 @@ merge_hosts() {
 }
 
 # 更新hosts文件
+# 修复点: 先写临时文件并校验，再原子替换，避免写坏 /etc/hosts
 update_hosts() {
     local new_content="$1"
-    printf "%s" "$new_content" > "$HOSTS_FILE"
-    if [ $? -eq 0 ]; then
+    local tmp_file="${HOSTS_FILE}.new.$$"
+
+    printf "%s\n" "$new_content" > "$tmp_file" 2>/dev/null
+    if [ $? -ne 0 ] || [ ! -s "$tmp_file" ]; then
+        log "hosts文件更新失败 (临时文件写入失败)"
+        rm -f "$tmp_file" 2>/dev/null
+        return 1
+    fi
+
+    # 内容校验: 必须至少有一个订阅源段落里含有效数据行
+    # （不能只看整个文件，因为 ORIGINAL HOSTS 段永远有 127.0.0.1 localhost）
+    if ! awk '
+        /^# BEGIN SOURCE:/ { in_src=1; next }
+        /^# END SOURCE:/   { in_src=0; next }
+        in_src && /^[0-9A-Fa-f:]/ { found=1 }
+        END { exit(found ? 0 : 1) }
+    ' "$tmp_file"; then
+        log "hosts文件更新失败 (所有源都没有有效条目，保持原状)"
+        rm -f "$tmp_file" 2>/dev/null
+        return 1
+    fi
+
+    chmod 644 "$tmp_file" 2>/dev/null
+    if mv "$tmp_file" "$HOSTS_FILE" 2>/dev/null; then
         log "hosts文件更新成功"
         return 0
     else
-        log "hosts文件更新失败"
+        log "hosts文件更新失败 (无法替换 $HOSTS_FILE)"
+        rm -f "$tmp_file" 2>/dev/null
         return 1
     fi
+}
+
+# 重载 DNS 服务，让新的 hosts 立即生效
+# 修复点: 原实现只写文件不通知 dnsmasq，导致新条目要等重启才生效
+reload_dns() {
+    local enabled
+    enabled=$(read_option "reload_dns" "$DEFAULT_RELOAD_DNS")
+    if [ "$enabled" = "0" ]; then
+        log "已按配置跳过 dnsmasq 重载 (reload_dns=0)"
+        return 0
+    fi
+
+    # 优先用 init 脚本（会做热点/订阅等完整刷新）
+    if [ -x /etc/init.d/dnsmasq ]; then
+        if /etc/init.d/dnsmasq reload >/dev/null 2>&1; then
+            log "已重载 dnsmasq，新 hosts 立即生效"
+            return 0
+        fi
+    fi
+
+    # 兜底: 直接给 dnsmasq 发 SIGHUP
+    if killall -q -HUP dnsmasq 2>/dev/null; then
+        log "已向 dnsmasq 发送 SIGHUP"
+        return 0
+    fi
+
+    log "警告: 未能重载 dnsmasq，新 hosts 需重启或手动执行 /etc/init.d/dnsmasq reload 后生效"
+    return 1
 }
 
 # 清理临时文件
@@ -201,20 +366,21 @@ get_source_url_by_name() {
 # 主更新函数
 do_update() {
     log "开始更新hosts文件..."
-    
+
     create_dirs
     backup_hosts
     cleanup
-    
+
     local download_success=false
     local sources
     sources=$(get_sources)
-    
+
     if [ -z "$sources" ]; then
         log "没有找到启用的hosts源"
+        cleanup
         return 1
     fi
-    
+
     # 避免管道子shell造成变量不可见，使用 here-string 在当前shell中读取
     while IFS='|' read -r name url; do
         [ -z "$name" ] && continue
@@ -224,12 +390,14 @@ do_update() {
     done <<EOF
 $sources
 EOF
-    
+
     if [ "$download_success" = true ]; then
         local merged_content
         merged_content=$(merge_hosts)
         if [ -n "$merged_content" ]; then
             if update_hosts "$merged_content"; then
+                # 关键: 写入成功后立即重载 DNS
+                reload_dns
                 log "hosts更新完成"
                 cleanup
                 return 0
@@ -240,6 +408,7 @@ EOF
             fi
         else
             log "合并结果为空，保持原状"
+            cleanup
             return 1
         fi
     else
@@ -257,8 +426,10 @@ show_status() {
     echo "hosts文件: $HOSTS_FILE"
     echo "备份目录: $BACKUP_DIR"
     echo "日志文件: $LOG_FILE"
+    echo "备份保留份数: $(read_option 'backup_keep' "$DEFAULT_BACKUP_KEEP")"
+    echo "更新后重载DNS: $(read_option 'reload_dns' "$DEFAULT_RELOAD_DNS")"
     echo ""
-    
+
     if [ -f "$SOURCES_FILE" ]; then
         echo "已配置的源:"
         cat "$SOURCES_FILE" | grep -v '^#' | grep -v '^$' | while IFS='|' read -r name url enabled; do
@@ -285,6 +456,7 @@ show_help() {
     echo "  status                  显示状态"
     echo "  backup                  创建备份"
     echo "  restore                 还原到原始状态"
+    echo "  reload-dns              手动重载 dnsmasq"
     echo "  help                    显示此帮助信息"
     echo ""
     echo "示例:"
@@ -298,6 +470,8 @@ do_restore() {
         cp "$BACKUP_DIR/hosts.original" "$HOSTS_FILE"
         log "已还原到原始hosts文件"
         echo "已还原到原始hosts文件"
+        # 还原后同样需要让 dnsmasq 重新读取
+        reload_dns
     else
         log "未找到原始hosts备份文件"
         echo "错误: 未找到原始hosts备份文件"
@@ -327,10 +501,16 @@ case "$1" in
         cleanup
         if download_hosts "$url" "$name"; then
             merged=$(merge_hosts)
-            update_hosts "$merged"
-            cleanup
-            echo "已完成单源更新: $name"
-            exit 0
+            if update_hosts "$merged"; then
+                reload_dns
+                cleanup
+                echo "已完成单源更新: $name"
+                exit 0
+            else
+                cleanup
+                echo "单源更新失败: $name (hosts 未改动)"
+                exit 1
+            fi
         else
             cleanup
             echo "单源更新失败: $name"
@@ -347,6 +527,9 @@ case "$1" in
     restore)
         do_restore
         ;;
+    reload-dns)
+        reload_dns
+        ;;
     help|--help|-h)
         show_help
         ;;
@@ -354,4 +537,4 @@ case "$1" in
         show_help
         exit 1
         ;;
-esac 
+esac

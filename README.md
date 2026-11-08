@@ -47,6 +47,27 @@ opkg install hostupdater_1.0.0-1_all.ipk
 - UCI配置: `/etc/config/hostupdater`
 - 源配置: `/etc/hostupdater/sources.conf`
 
+可选配置项（不写也能正常工作，使用默认值）：
+
+```
+config hostupdater 'main'
+	option enabled '1'
+	option interval '1'
+	option auto_backup '1'
+	option log_level 'info'
+
+	# 更新 /etc/hosts 后自动重载 dnsmasq，让新条目立即生效（默认 1）
+	option reload_dns '1'
+
+	# 备份文件保留份数，超出的自动删除（默认 24，0 = 不轮转）
+	option backup_keep '24'
+```
+
+> ⚠️ `reload_dns` 很重要：dnsmasq 在启动时把 hosts 读进内存，不主动重读。
+> 关掉它的话，更新完必须手动执行 `/etc/init.d/dnsmasq reload` 或重启，否则设备拿到的仍是旧值。
+
+详细修复记录见 [CHANGELOG.md](CHANGELOG.md)。
+
 ### 添加hosts源
 
 编辑 `/etc/hostupdater/sources.conf` 文件，格式如下：
@@ -62,11 +83,29 @@ tmdb_ipv6|https://raw.githubusercontent.com/cnwikee/CheckTMDB/refs/heads/main/Tm
   - 原始系统hosts（安装时备份的内容）
   - 每个订阅源的BEGIN/END注释块
 - 去重策略：按行解析得到"IP + 主机名列表"，对主机名进行去重，保留首次出现的映射
+- **原始系统hosts段（`BEGIN/END ORIGINAL HOSTS`）内的内容原样保留，不参与去重**
+  （否则 `127.0.0.1 localhost` 会把 `::1` 行的 `localhost` 挤掉）
+- 行内 `#` 之后的内容不会被当作主机名
 - 优先级：
   1. 原始系统hosts（最高）
   2. 第1个订阅源
   3. 第2个订阅源 … 依次类推
 - 这样可以避免同一域名被后续源覆盖，保障系统自带记录与用户自定记录优先
+
+### 条目过滤
+
+写入前会丢弃以下条目（订阅源常用注释标注失效节点）：
+
+| 被丢弃的内容 | 说明 |
+|---|---|
+| `IP 域名 # Timeout`<br>`IP 域名 # 超时` | 源自己标记测速失败/失效 |
+| `IP 域名 # Expired` / `# Dead` / `# Failed` | 其它失效标记 |
+| `0.0.0.0  域名` | DNS 污染常见值 |
+| `127.0.0.1 域名` | 环回，写进 hosts 会直接劫持 |
+| `224.x` ~ `255.x` | 组播/保留段，不可路由 |
+| `::` / `::1` | 空的/环回 IPv6 |
+
+日志会记录跳过数量：`解析完成: github (有效行 40, 跳过失效/非法 2)`
 
 ## 使用方法
 
@@ -94,6 +133,9 @@ hostupdater backup
 
 # 还原到原始状态
 hostupdater restore
+
+# 手动重载 dnsmasq（让 hosts 立即生效）
+hostupdater reload-dns
 ```
 
 ### 服务管理

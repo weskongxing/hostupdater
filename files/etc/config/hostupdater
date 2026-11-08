@@ -3,3 +3,11 @@ config hostupdater 'main'
 	option interval '1'
 	option auto_backup '1'
 	option log_level 'info'
+
+	# 更新 /etc/hosts 后自动重载 dnsmasq，让新条目立即生效
+	# 0 = 不重载（需要手动 /etc/init.d/dnsmasq reload 或重启）
+	option reload_dns '1'
+
+	# 备份目录保留的份数，超出的旧备份会自动删除，避免占满 flash
+	# 0 = 不轮转（不推荐，每小时一份会持续增长）
+	option backup_keep '24'
